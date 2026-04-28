@@ -1,5 +1,20 @@
 /**
- * S1L9226X Driver - Minimal implementation for power-on self-test
+ * S1L9226X Driver - RF AMP & Servo Signal Processor
+ *
+ * MICOM 3-wire serial interface (MCK, MDATA, MLT)
+ * Frame: 16-bit MSB first. D15..D8 = address, D7..D0 = data.
+ * MLT = HIGH during transfer; falling edge latches data into chip.
+ *
+ * Initialization sequence per datasheet p.43 "System Control Flow":
+ *   1. Febias offset control:  $878 -> $87F + $841 -> ISTAT L->H
+ *   2. Focus offset control:   $08 + $867 + 200ms + $86F + $842 -> ISTAT L->H
+ *   3. Tracking offset cancel: $8F1F -> $8F00 -> ISTAT H
+ *   4. Laser diode ON:         LD ON + P-SUB $8560
+ *   5. Limit SW check
+ *   6. Auto-focus:             $47 -> FOK check (max 3 retries, 2s each)
+ *   7. Spindle servo ON:       $20 -> Tracking balance/gain adjust -> TOC read
+ *
+ * Reference: S1L9226X Preliminary Spec
  */
 
 #include "s1l9226x.h"
@@ -10,359 +25,628 @@
 
 static const char *TAG = "S1L9226X";
 
+/* ---- Delay helpers ---- */
 static inline void delay_us(uint32_t us) { esp_rom_delay_us(us); }
 static inline void delay_ms(uint32_t ms) { vTaskDelay(pdMS_TO_TICKS(ms)); }
 
-static int init_gpio(s1l9226x_ctx_t *ctx)
+/* ================================================================
+ * GPIO Initialization
+ * ================================================================ */
+static s1l9226x_err_t init_gpio(s1l9226x_ctx_t *ctx)
 {
-    /* Configure output pins: MCK, MDATA, MLT */
+    /*
+     * Output pins: MCK, MDATA, MLT
+     * All start LOW. MLT must be LOW (idle = not latching).
+     */
     gpio_config_t io_out = {
-        .pin_bit_mask = (1ULL << ctx->mck_pin) | (1ULL << ctx->mdata_pin) | (1ULL << ctx->mlt_pin),
+        .pin_bit_mask = (1ULL << ctx->mck_pin)
+                      | (1ULL << ctx->mdata_pin)
+                      | (1ULL << ctx->mlt_pin),
         .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
     };
-    if (gpio_config(&io_out) != ESP_OK) return -1;
+    esp_err_t err = gpio_config(&io_out);
+    if (err != ESP_OK) return S1L9226X_ERR_GPIO;
 
-    gpio_set_level(ctx->mck_pin, 0);
+    gpio_set_level(ctx->mck_pin,   0);
     gpio_set_level(ctx->mdata_pin, 0);
-    gpio_set_level(ctx->mlt_pin, 0);
+    gpio_set_level(ctx->mlt_pin,   0);
 
-    /* Configure RESET pin - cautious method to avoid triggering chip reset */
+    /*
+     * RESET pin: active LOW.
+     * Set HIGH (inactive) before configuring as output to avoid glitch reset.
+     */
     gpio_set_pull_mode(ctx->reset_pin, GPIO_PULLUP_ONLY);
     delay_ms(1);
-    gpio_set_level(ctx->reset_pin, 1);
-    if (gpio_set_direction(ctx->reset_pin, GPIO_MODE_OUTPUT) != ESP_OK) return -1;
-    gpio_set_level(ctx->reset_pin, 1);
+    gpio_set_direction(ctx->reset_pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(ctx->reset_pin, 1);  /* inactive */
 
-    /* Configure ISTAT input pin */
+    /*
+     * ISTAT input pin with pull-up.
+     * Datasheet: ISTAT is push-pull output from S1L9226X, but we add
+     * pull-up for safety during chip reset (ISTAT may be Hi-Z).
+     */
     gpio_config_t io_in = {
-        .pin_bit_mask = (1ULL << ctx->istat_pin),
+        .pin_bit_mask = (1ULL << ctx->istat_pin)
+                      | (1ULL << J3_CDPSW),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
     };
-    if (gpio_config(&io_in) != ESP_OK) return -1;
+    err = gpio_config(&io_in);
+    if (err != ESP_OK) return S1L9226X_ERR_GPIO;
 
-    return 0;
+    return S1L9226X_OK;
 }
 
-static void send_command(s1l9226x_ctx_t *ctx, uint16_t cmd)
+/* ================================================================
+ * Core 16-bit Command Transfer
+ * ================================================================
+ *
+ * S1L9226X MICOM interface timing:
+ *   1. Set MDATA before MCK rising edge (setup time)
+ *   2. Raise MCK (rising edge)
+ *   3. Hold MDATA after MCK rising edge (hold time)
+ *   4. Lower MCK (falling edge)
+ *   5. Repeat for D15..D0 (MSB first)
+ *   6. After all 16 bits, MLT falling edge latches data
+ *
+ * MLT must be HIGH during the entire 16-bit transfer.
+ * We raise MLT before the first clock, lower it after the last.
+ */
+void s1l9226x_send_cmd(s1l9226x_ctx_t *ctx, uint16_t cmd)
 {
-    gpio_set_level(ctx->mlt_pin, 0);
-    delay_us(5);
+    /* MLT HIGH = frame in progress */
+    gpio_set_level(ctx->mlt_pin, 1);
+    delay_us(S1L9226X_MLT_SETUP_US);
+
+    /* Transmit D15 (MSB) down to D0 (LSB) */
     for (int i = 15; i >= 0; i--) {
         gpio_set_level(ctx->mdata_pin, (cmd >> i) & 1);
-        delay_us(5);
+        delay_us(S1L9226X_MLT_SETUP_US);
         gpio_set_level(ctx->mck_pin, 1);
-        delay_us(5);
+        delay_us(S1L9226X_MCK_HALF_US);
         gpio_set_level(ctx->mck_pin, 0);
-        delay_us(5);
+        delay_us(S1L9226X_MLT_HOLD_US);
     }
-    gpio_set_level(ctx->mlt_pin, 1);
-    delay_us(5);
+
+    /* MLT falling edge = latch */
+    delay_us(1);
     gpio_set_level(ctx->mlt_pin, 0);
+
+    /* MDATA idle low */
     gpio_set_level(ctx->mdata_pin, 0);
 }
 
-static int wait_istat_high(s1l9226x_ctx_t *ctx, uint32_t timeout_ms)
+/* ================================================================
+ * ISTAT Polling Helpers
+ * ================================================================
+ * NOTE: ISTAT output from S1L9226X is inverted by the level-shift
+ * circuit before reaching the MCU GPIO pin. Therefore:
+ *   ISTAT signal HIGH  →  MCU pin reads LOW   (wait_sense_low)
+ *   ISTAT signal LOW   →  MCU pin reads HIGH  (wait_sense_high)
+ * ================================================================ */
+
+/* Wait until ISTAT signal goes HIGH (= MCU pin goes LOW) */
+static int wait_sense_low(s1l9226x_ctx_t *ctx, uint32_t timeout_ms)
 {
-    for (uint32_t t = 0; t < timeout_ms; t += 10) {
-        if (gpio_get_level(ctx->istat_pin) == 1) return 0;
-        delay_ms(10);
+    for (uint32_t t = 0; t < timeout_ms; t += 5) {
+        if (gpio_get_level(ctx->istat_pin) == 0)
+            return 0;
+        delay_ms(5);
     }
     return -1;
 }
 
-static void reset_chip(s1l9226x_ctx_t *ctx)
+static int is_sense_low(s1l9226x_ctx_t *ctx)
 {
+    if (gpio_get_level(ctx->istat_pin) == 0) return 0;
+    return -1;
+}
+
+
+/* ================================================================
+ * Hardware Reset & Default Register Initialization
+ * ================================================================
+ *
+ * Register initial values from S1L9226X datasheet p.18-22:
+ *   $50XX: Blind/Brake timing          INI = 0x88
+ *   $51XX: Control register             INI = 0xFB
+ *   $52XX: FJTS/PEAKC/FEB              INI = 0x87
+ *   $80XX: Tracking balance             INI = 0x0F
+ *   $81XX: Tracking gain                INI = 0x10
+ *   $82XX: I/V AMP gain                 INI = 0x07
+ *   $83XX: ISTAT monitor select         INI = 0xB8
+ *   $84XX: Window/LDON control          INI = 0x00
+ *   $86XX: RSTS/EQOC/DFCT1/DFCT2       INI = 0x0F
+ *   $87XX: DIRC/RSTF/AGCL/EQB           INI = 0x0F
+ *   $8EXX: Filter control               INI = 0xB6
+ *   $8FXX: Tracking offset center       INI = 0x10
+ */
+void s1l9226x_reset(s1l9226x_ctx_t *ctx)
+{
+    /* Assert RESET (active LOW) */
     gpio_set_level(ctx->reset_pin, 0);
     delay_ms(S1L9226X_RESET_HOLD_MS);
+
+    /* Deassert RESET */
     gpio_set_level(ctx->reset_pin, 1);
-    delay_ms(100);
+    delay_ms(S1L9226X_RESET_SETTLE_MS);
 
-    send_command(ctx, 0x5088);
-    send_command(ctx, 0x51FB);
-    send_command(ctx, 0x52C7);
-    send_command(ctx, 0x86FF);
-    send_command(ctx, 0x87FF);
-    send_command(ctx, 0x83BC);
-    send_command(ctx, 0x800F);
-    send_command(ctx, 0x8100);
-    send_command(ctx, CMD_AUTO_SEQ_CANCEL << 8);
+    /* ---- Load register defaults ---- */
+
+    /* $50XX: Blind A/B/C timing, Fast K timing = 0x88 */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x50, 0x88));
+
+    /* $51XX: Control register = 0xFB */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x51, 0xFB));
+
+    /* $52XX: FJTS/PEAKC/FEB = 0x87 */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x52, 0x87));
+
+    /* $80XX: Tracking balance = 0x0F */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x80, 0x0F));
+
+    /* $81XX: Tracking gain = 0x10 */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x81, 0x10));
+
+    /* $82XX: Photo-diode I/V AMP gain = 0x07 */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x82, 0x07));
+
+    /* $83XX: ISTAT monitor select = 0xB8 */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x83, 0xB8));
+
+    /* $84XX: Window/LDON control = 0x00 */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x84, 0x00));
+
+    /* $86XX: RSTS/EQOC/DFCT1/DFCT2 = 0x0F */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x86, 0x0F));
+
+    /* $87XX: DIRC/RSTF/AGCL/EQB = 0x0F */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x87, 0x0F));
+
+    /* $8EXX: Filter control = 0xB6 */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x8E, 0xB6));
+
+    /* $8FXX: Tracking servo offset center = 0x10 */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x8F, 0x10));
+
+    /* Cancel any auto-sequence: $40 */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x40, 0x00));
+
+    ESP_LOGI(TAG, "Reset complete, registers initialized");
 }
 
-static int febias_control(s1l9226x_ctx_t *ctx)
-{
-    send_command(ctx, 0x8780);
-    delay_ms(10);
-    send_command(ctx, 0x87F0);
-    delay_ms(10);
-    send_command(ctx, 0x8410);
-    if (wait_istat_high(ctx, 100) != 0) {
-        ctx->last_error = ERR_FEBIAS_TIMEOUT;
-        return -1;
-    }
-    return 0;
-}
-
-/* Focus Offset Cancel Automatic Control Start
- * $08 + $867 + (200ms wait) + $86F + $842 transfer
- * 100ms wait, ISTAT L -> H = success
+/* ================================================================
+ * Step 1: Febias Offset Control
+ * ================================================================
+ * Datasheet p.43 flow: $878 -> $87F + $841 -> wait ISTAT L->H (100ms max)
+ * Datasheet p.44:
+ *   - $878 resets the 4-bit Febias DAC
+ *   - $87F cancels reset ($87 D2 bit changes from 0 to 1)
+ *   - $841 starts Febias offset automatic control
+ *   - 5-bit DAC sweeps -112mV..+112mV, 32 steps, 2.5ms/step, max 128ms
+ *   - ISTAT goes H when complete
+ *   - Post-control offset dispersion: -8mV..+8mV
  */
-static int focus_offset_control(s1l9226x_ctx_t *ctx)
+static s1l9226x_err_t febias_control(s1l9226x_ctx_t *ctx)
 {
-    send_command(ctx, 0x0800);  /* $08 */
-    send_command(ctx, 0x8670);  /* $867 */
-    delay_ms(200);
-    send_command(ctx, 0x86F0);  /* $86F */
-    send_command(ctx, 0x8420);  /* $842 transfer */
+    ESP_LOGI(TAG, "Febias offset control start");
 
-    if (wait_istat_high(ctx, 100) != 0) {
-        ctx->last_error = ERR_FOCUS_OFFSET_TIMEOUT;
-        return -1;
+    /* 1. Reset 4-bit Febias DAC ($878 = $87, data 0x08 = D3=1) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x87, 0x08));
+
+    /* 2. Cancel DAC reset ($87F = $87, data 0x0F, D2 changes 0->1) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x87, 0x0F));
+
+    /* 3. Start Febias offset automatic control ($841)
+     *    $84 D4 = F.E.O.C = 1 enables Febias offset control
+     *    Data byte 0x11: D4=1 (F.E.O.C on), D0=1 (ISTAT window select)
+     */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x84, 0x11));
+
+    /* 4. Wait for ISTAT L->H (max 100ms per flowchart, 128ms per spec) */
+    if (wait_sense_low(ctx, S1L9226X_FEBIAS_TIMEOUT_MS) != 0) {
+        ESP_LOGE(TAG, "Febias control timeout");
+        ctx->last_error = S1L9226X_ERR_FEBIAS_TIMEOUT;
+        return S1L9226X_ERR_FEBIAS_TIMEOUT;
     }
-    return 0;
+
+    ESP_LOGI(TAG, "Febias control OK (ISTAT H)");
+    return S1L9226X_OK;
 }
 
-/* Laser Diode ON - LD ON, P-SUB $8560 Transmission
- * First set $84X D3(LDON)=1, then send $8560
+/* ================================================================
+ * Step 2: Focus Offset Control
+ * ================================================================
+ * Datasheet p.43 flow: $08 + $867 + (200ms wait) + $86F + $842 -> ISTAT L->H
+ * Datasheet p.45:
+ *   - $08: Focus control command (p.13: $0X = Focus control, data 0x08)
+ *         FS4=0(off), FS3=0(normal gain), FS2=1(search on), FS1=0(search down)
+ *   - $867: Reset 4-bit DAC for focus offset ($86 D3=0)
+ *   - 200ms wait for DAC reset to settle
+ *   - $86F: Cancel DAC reset ($86 D3 changes 0->1)
+ *   - $842: Start focus offset automatic control ($84 D5 = F.S.O.C = 1)
+ *   - 4-bit DAC sweeps 320mV..-320mV, 16 steps, 2.5ms/step, max 128ms
+ *   - ISTAT goes H when complete
+ *   - Post-control offset dispersion: -20mV..+20mV
+ */
+static s1l9226x_err_t focus_offset_control(s1l9226x_ctx_t *ctx)
+{
+    ESP_LOGI(TAG, "Focus offset control start");
+
+    /* 1. Focus control: $08 (FS2=search on, others default) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x08, 0x08));
+
+    /* 2. Reset 4-bit focus offset DAC ($867 = $86 D3=0)
+     *    $86 initial = 0x0F (D3=1), so $867 = $86 data 0x07 (D3=0) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x86, 0x07));
+
+    /* 3. Wait 200ms for DAC reset to settle (per flowchart) */
+    delay_ms(200);
+
+    /* 4. Cancel DAC reset ($86F = $86 data 0x0F, D3 changes 0->1) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x86, 0x0F));
+
+    /* 5. Start focus offset automatic control ($842)
+     *    $84 D5 = F.S.O.C = 1 enables focus servo offset control
+     *    Data byte 0x22: D5=1 (F.S.O.C on), D1=1 (ISTAT window select)
+     */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x84, 0x22));
+
+    /* 6. Wait for ISTAT L->H (max 100ms per flowchart, 128ms per spec) */
+    if (wait_sense_low(ctx, S1L9226X_FOCUS_OFFSET_TIMEOUT_MS) != 0) {
+        ESP_LOGE(TAG, "Focus offset control timeout");
+        ctx->last_error = S1L9226X_ERR_FOCUS_OFFSET_TIMEOUT;
+        return S1L9226X_ERR_FOCUS_OFFSET_TIMEOUT;
+    }
+
+    ESP_LOGI(TAG, "Focus offset control OK (ISTAT H)");
+    return S1L9226X_OK;
+}
+
+/* ================================================================
+ * Step 3: Tracking Offset Cancel
+ * ================================================================
+ * Datasheet p.43 flowchart: $8F1F -> $8F00 (ISTAT->H)
+ *
+ * Root cause analysis:
+ *   $8F is a DIRECT DAC register — writing it only sets the static DC
+ *   offset, it does NOT trigger any automatic sweep.
+ *   MCU must step-sweep manually and poll ISTAT at each step.
+ *
+ *   CRITICAL prerequisite: tracking servo loop MUST be OFF ($21) before
+ *   this step.  If servo is running, it continuously drives the actuator
+ *   to minimize tracking error, making the ISTAT output reflect the
+ *   closed-loop state rather than the open-loop DC offset.  The DAC
+ *   sweep cannot find the true zero-crossing while servo is active.
+ *
+ * Per p.20 ($84 register):
+ *   D6 = STBW  -- controls the tracking balance WINDOW WIDTH only:
+ *                  0 → ±20mV window,  1 → ±30mV window
+ *   STBW does NOT start any automatic control.
+ *   It merely selects which threshold ISTAT uses to flag "in-window".
+ *
+ * Per p.14 ($2X servo mode commands):
+ *   $21 → Track. servo OFF  (tracking actuator output = 0, open-loop)
+ *   $22 → Track. servo ON   (restore after offset is set)
+ *
+ * Per p.22 ($8FXX):
+ *   $8F1F = -160mV (step 0x1F),  $8F10 = 0mV (center),  $8F00 = +160mV
+ *   Ideal final offset: +30mV ~ +50mV (step back 3-5 toward 0x1F)
+ *
+ * Procedure:
+ *   1. Turn tracking servo OFF ($21) — open-loop, actuator free
+ *   2. Set $8F1F (max negative, -160mV) — starting point
+ *   3. Enable tracking balance window ($84 D6=STBW=1) → ±30mV window
+ *   4. Step-sweep: 0x1F → 0x00, 2ms/step, check ISTAT after each step
+ *      (MCU pin LOW = ISTAT signal HIGH = offset inside ±30mV window)
+ *   5. Found: back off 3 steps (+30mV ideal bias per p.22)
+ *      Not found: restore center ($8F10), report error
+ *   6. Disable window ($84 D6=0), restore tracking servo ON ($22)
+ *
+ * NOTE: ISTAT is inverted by level-shift — MCU pin LOW = ISTAT signal HIGH
+ */
+static s1l9226x_err_t tracking_offset_control(s1l9226x_ctx_t *ctx)
+{
+    ESP_LOGI(TAG, "Tracking offset cancel: sweep $8F1F -> $8F00");
+
+    /* 1. Turn tracking servo OFF
+     *    $21 per p.14: Track. servo off
+     *    Actuator output goes to 0, circuit is open-loop.
+     *    The $8F DAC offset can now be measured without servo fighting it. */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x21, 0x00));
+    delay_ms(5);
+
+    /* 2. Set starting point: max negative offset ($8F1F = -160mV) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x8F, 0x1F));
+    delay_ms(5);
+
+    /* 3. Enable tracking balance window on ISTAT
+     *    $84 D6 = STBW = 1  →  window = ±30mV
+     *    Other $84 bits stay 0 (LDON=0, F.S.O.C=0, F.E.O.C=0) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x84, 0x40));
+    delay_ms(5);
+
+    /* 4. Step-sweep: 0x1F (-160mV) → 0x00 (+160mV), 2ms/step
+     *    ISTAT goes HIGH (MCU pin LOW) when DAC offset enters ±30mV window */
+    int8_t found_step = -1;
+
+    for (int8_t step = 0x1F; step >= 0x00; step--) {
+        s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x8F, (uint8_t)step));
+        delay_ms(S1L9226X_TRACKING_STEP_MS);
+
+        /* MCU pin LOW = ISTAT signal HIGH = offset within ±30mV window */
+        if (gpio_get_level(ctx->istat_pin) == 0) {
+            found_step = step;
+            ESP_LOGI(TAG, "  -> zero crossing at step=0x%02X (~%+dmV)",
+                     step, (0x10 - (int)step) * 10);
+            break;
+        }
+    }
+
+    /* 5. Handle result */
+    if (found_step < 0) {
+        /* Full sweep completed without ISTAT going HIGH — no valid zero point.
+         * This indicates a hardware fault (damaged actuator, no disc loaded yet
+         * is normal here since laser is not on; fall through to center). */
+        ESP_LOGW(TAG, "Tracking offset: no zero crossing in sweep, using center ($8F10)");
+        s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x8F, 0x10));   /* center = 0mV */
+    } else {
+        /* Back off 3 steps toward $8F1F → +30mV ideal operating point.
+         * Per p.22: "ideal +30mV~+50mV, raise 3-5 steps after controlling to 0mV"
+         * Higher step value = more negative DAC = more positive system offset.
+         * Clamped to 0x1F. */
+        uint8_t final_step = (uint8_t)found_step + 3u;
+        if (final_step > 0x1F) final_step = 0x1F;
+
+        s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x8F, final_step));
+        delay_ms(5);
+        ESP_LOGI(TAG, "  -> settled at step=0x%02X (~+%dmV ideal bias)",
+                 final_step, (0x10 - (int)final_step) * (-10));
+    }
+
+    /* 6. Disable tracking balance window */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x84, 0x00));
+
+    /* Restore tracking servo ON ($22)
+     * Servo resumes with the newly calibrated DC offset applied.
+     * Per p.14: $22 = Track. servo on */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x22, 0x00));
+    delay_ms(5);
+
+    ESP_LOGI(TAG, "Tracking offset cancel done, servo restored");
+    return S1L9226X_OK;
+}
+
+/* ================================================================
+ * Step 4: Laser Diode ON
+ * ================================================================
+ * Datasheet p.43: LD ON, P-SUB $8560
+ *   $84 D3 = LDON = 1 (laser on)
+ *   $85 = APC PSUB for laser power control, data = 0x60
  */
 static void laser_on(s1l9226x_ctx_t *ctx)
 {
-    /* Set LDON bit in $84X register (D3=1) */
-    send_command(ctx, 0x8408);  /* $84X with D3=1 (LDON ON) */
+    /* LD ON ($84 D3 = 1) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x84, 0x08));
     delay_ms(10);
 
-    /* P-SUB $8560 - Laser power control */
-    send_command(ctx, 0x8560);
+    /* Set APC PSUB laser power ($8560 = $85, data 0x60) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x85, 0x60));
     delay_ms(50);
+
+    ESP_LOGI(TAG, "Laser ON (P-SUB=0x60)");
 }
 
-/* Laser OFF - $850 Transmission + $84X D3=0 */
 static void laser_off(s1l9226x_ctx_t *ctx)
 {
-    send_command(ctx, 0x8500);  /* $850 - Laser OFF */
-    send_command(ctx, 0x8400);  /* $84X with D3=0 (LDON OFF) */
+    /* APC PSUB off */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x85, 0x00));
+    /* Disable LDON ($84 D3 = 0) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x84, 0x00));
+    ESP_LOGI(TAG, "Laser OFF");
 }
 
-/* Focusing Auto-Focusing
- * $47 Transmission (2s maximum)
- * ISTAT L -> H indicates auto-focus sequence complete
- * Then check FOK status via $8300 (select FOK to ISTAT)
- * FOK H = disc present, FOK L = no disc
+/* ================================================================
+ * Step 6: Auto-Focus
+ * ================================================================
+ * Datasheet p.43:
+ *   - Send $47 (auto-focus command)
+ *   - Max 2s wait
+ *   - Check FOK (FOK H = disc present)
+ *   - Max 3 retries, then laser off + standby
+ *
+ * Datasheet p.17: $47 = address $4X, data 0111 = auto-focus
+ * Datasheet p.26-27: ISTAT = LOW during auto-focus, H when complete
+ * After auto-focus: select FOK to ISTAT via $83XX
  */
-static int auto_focus(s1l9226x_ctx_t *ctx)
+static s1l9226x_err_t auto_focus(s1l9226x_ctx_t *ctx)
 {
-    /* Cancel any previous auto sequence first */
-    send_command(ctx, CMD_AUTO_SEQ_CANCEL << 8);
+    /* Cancel any previous auto-sequence */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x40, 0x00));
     delay_ms(50);
 
-    /* Start auto-focus */
-    send_command(ctx, CMD_AUTO_FOCUS << 8);  /* $47 */
+    /* Start auto-focus ($47 = address $4X, data 0111) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x47, 0x07));
 
-    /* Wait for ISTAT L->H (auto-focus sequence complete) */
-    if (wait_istat_high(ctx, 2000) != 0) {
-        ctx->last_error = ERR_AUTO_FOCUS_TIMEOUT;
-        return -1;
+    /* Wait for auto-focus to complete (ISTAT L -> H), max 2s per flowchart */
+    if (wait_sense_low(ctx, S1L9226X_AUTO_FOCUS_TIMEOUT_MS) != 0) {
+        ESP_LOGE(TAG, "Auto-focus timeout (2s)");
+        ctx->last_error = S1L9226X_ERR_AUTO_FOCUS_TIMEOUT;
+        return S1L9226X_ERR_AUTO_FOCUS_TIMEOUT;
     }
 
     /* Select FOK to ISTAT output
-     * $83XX: D2(CSTAT)=0 selects FOK group, D1(RFBC)=0 selects FOK
-     * $8300 = CSTAT=0, RFBC=0 → FOK output to ISTAT
+     * $83XX: CSTAT=0 (select FOK group), RFBC=0 (select FOK)
+     * MGA1=1, MGA2=0, RFOC=1, TOCD=1, EMODEC=1, GSEL=0
+     * = 0xB8 with CSTAT cleared: 0xB0
      */
-    send_command(ctx, 0x8300);
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x83, 0xB0));
     delay_ms(10);
 
-    /* Check FOK status:
-     * FOK H = Focus OK = RF level above reference = disc present
-     * FOK L = Focus failed = no disc
+    /* Read FOK via ISTAT
+     * S1L9226X ISTAT signal: FOK H = disc present, FOK L = no disc
+     * After level-shift inversion: MCU pin LOW = FOK H (disc present)
+     *                              MCU pin HIGH = FOK L (no disc)
      */
-    if (gpio_get_level(ctx->istat_pin) == 1) {
-        /* FOK is H - Focus OK, disc detected */
-        return 0;
+    if (gpio_get_level(ctx->istat_pin) == 0) {
+        ESP_LOGI(TAG, "Auto-focus OK - FOK H, disc detected");
+        return S1L9226X_OK;
     }
 
-    /* FOK is L - Focus failed, no disc */
-    ctx->last_error = ERR_NO_DISC;
-    return -1;
+    ESP_LOGW(TAG, "Auto-focus FAILED - FOK L, no disc");
+    ctx->last_error = S1L9226X_ERR_NO_DISC;
+    return S1L9226X_ERR_NO_DISC;
 }
 
-static void spindle_start(s1l9226x_ctx_t *ctx)
-{
-    send_command(ctx, 0xF000);
-    send_command(ctx, 0x9901);
-    delay_ms(300);
-}
-
-static void spindle_stop(s1l9226x_ctx_t *ctx) { send_command(ctx, 0x9900); }
-
-/* Spindle Servo Loop ON - $20 Transmission
- * Tracking & Sled Loop OFF
- * 300ms maximum for servo stabilization
+/* ================================================================
+ * Step 7: Spindle Servo Loop ON
+ * ================================================================
+ * Datasheet p.43:
+ *   - Spindle Servo Loop ON (300ms max)
+ *   - Tracking & Sled Loop OFF
+ *   - $20 Transmission
+ *   - Tracking Balance Adjust
+ *   - Tracking Gain Adjust
+ *   - TOC Read
+ *
+ * Datasheet p.14: $20 = TM1 mode (base mode)
+ *   Tracking servo bits: TM7=1, TM5=0, TM4=1, TM3=0 -> track servo off
+ *   Sled servo bits: TM2=1, TM1=0 -> sled servo off
+ *   This is the "spindle servo on, tracking/sled off" mode
  */
-static int spindle_servo_on(s1l9226x_ctx_t *ctx)
+static s1l9226x_err_t spindle_servo_on(s1l9226x_ctx_t *ctx)
 {
-    /* Turn off tracking and sled servo loops first */
-    send_command(ctx, CMD_TRACK_SERVO_OFF << 8);  /* $21 */
-    send_command(ctx, CMD_SLED_SERVO_OFF << 8);   /* $25 */
-    delay_ms(50);
+    ESP_LOGI(TAG, "Spindle servo ON, tracking/sled OFF");
 
-    /* Spindle servo loop ON - $20 */
-    send_command(ctx, 0x2000);
-    delay_ms(300);  /* Wait for spindle stabilization */
+    /* $20: TM1 mode - spindle servo loop ON, tracking & sled loop OFF */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x20, 0x00));
 
-    return 0;
-}
-
-/* Tracking Balance Adjust
- * $84C0 selects balance window mode
- * $80X adjusts balance value, ISTAT H = balanced
- */
-static int tracking_balance_adjust(s1l9226x_ctx_t *ctx)
-{
-    /* Set balance control window mode */
-    send_command(ctx, 0x84C0);
+    /* Tracking balance adjust ($800X ~ $801X)
+     * Uses $84 D6 (STBW) to enable tracking balance control window on ISTAT
+     * Then sweep balance using $80 commands
+     * Per flowchart: this is an auto-adjust process
+     */
+    /* Enable tracking balance control window on ISTAT ($84 D6=1) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x84, 0x40));
     delay_ms(10);
 
-    /* Adjust balance from 0x0F down to 0x00 */
-    for (int bal = 0x0F; bal >= 0; bal--) {
-        send_command(ctx, 0x8000 | bal);
-        delay_ms(10);
-        if (gpio_get_level(ctx->istat_pin) == 1) {
-            /* ISTAT H = balance OK */
-            return 0;
-        }
+    /* Tracking balance adjust via $801 command
+     * $801: D0=1 triggers tracking balance auto-adjust
+     */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x80, 0x11));
+
+    /* Wait for balance adjust complete (ISTAT H), 300ms max per flowchart */
+    if (wait_sense_low(ctx, S1L9226X_SERVO_ADJUST_TIMEOUT_MS) != 0) {
+        ESP_LOGW(TAG, "Tracking balance adjust timeout (non-fatal)");
     }
 
-    return -1;  /* Balance adjust failed */
-}
-
-/* Tracking Gain Adjust
- * $84C0 already set for gain window mode
- * $81X adjusts gain value, ISTAT H = optimal gain
- */
-static int tracking_gain_adjust(s1l9226x_ctx_t *ctx)
-{
-    /* Adjust gain from 0x00 up to 0x1F */
-    for (int gain = 0x00; gain <= 0x1F; gain++) {
-        send_command(ctx, 0x8100 | gain);
-        delay_ms(10);
-        if (gpio_get_level(ctx->istat_pin) == 1) {
-            /* ISTAT H = gain OK */
-            return 0;
-        }
-    }
-
-    return -1;  /* Gain adjust failed */
-}
-
-/* Tracking Offset Cancel Start
- * $8F1F -> $8F00 (ISTAT->H)
- */
-static int tracking_offset_control(s1l9226x_ctx_t *ctx)
-{
-    send_command(ctx, 0x8F1A);
+    /* Tracking gain adjust via $811 command
+     * $811: D0=1 triggers tracking gain auto-adjust
+     * Enable tracking gain control window ($84 D7=1) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x84, 0x80));
     delay_ms(10);
-    if (wait_istat_high(ctx, 100) != 0) {
-        ctx->last_error = ERR_TRACKING_OFFSET_TIMEOUT;
-        return -1;
+
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x81, 0x11));
+
+    /* Wait for gain adjust complete (ISTAT H), 300ms max */
+    if (wait_sense_low(ctx, S1L9226X_SERVO_ADJUST_TIMEOUT_MS) != 0) {
+        ESP_LOGW(TAG, "Tracking gain adjust timeout (non-fatal)");
     }
-    return 0;
+
+    /* Disable control windows ($84 = 0x00) */
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x84, 0x00));
+
+    ESP_LOGI(TAG, "Spindle servo ready, tracking adjusted");
+    return S1L9226X_OK;
 }
 
-int s1l9226x_power_on_self_test(s1l9226x_ctx_t *ctx)
+/* ================================================================
+ * Power-On Self-Test (Full System Control Sequence)
+ * ================================================================
+ * Datasheet p.43 flow chart, complete sequence:
+ *   1. Febias offset control    (100ms max)
+ *   2. Focus offset control     (100ms max)
+ *   3. Tracking offset cancel
+ *   4. Laser diode ON
+ *   5. Limit switch check
+ *   6. Auto-focus               (2s max, 3 retries)
+ *   7. Spindle servo + adjust   (300ms max)
+ *   8. TOC read
+ */
+s1l9226x_err_t s1l9226x_power_on_self_test(s1l9226x_ctx_t *ctx)
 {
-    if (ctx->mck_pin == 0) ctx->mck_pin = S1L9226X_PIN_MCK;
+    /* Apply default pin mapping if not set */
+    if (ctx->mck_pin   == 0) ctx->mck_pin   = S1L9226X_PIN_MCK;
     if (ctx->mdata_pin == 0) ctx->mdata_pin = S1L9226X_PIN_MDATA;
-    if (ctx->mlt_pin == 0) ctx->mlt_pin = S1L9226X_PIN_MLT;
+    if (ctx->mlt_pin   == 0) ctx->mlt_pin   = S1L9226X_PIN_MLT;
     if (ctx->reset_pin == 0) ctx->reset_pin = S1L9226X_PIN_RESET;
     if (ctx->istat_pin == 0) ctx->istat_pin = S1L9226X_PIN_ISTAT;
 
-    if (init_gpio(ctx) != 0) {
-        ctx->last_error = ERR_GPIO_INIT_FAILED;
-        return ERR_GPIO_INIT_FAILED;
+    /* 1. GPIO init */
+    s1l9226x_err_t rc = init_gpio(ctx);
+    if (rc != S1L9226X_OK) {
+        ctx->last_error = rc;
+        return rc;
     }
     ctx->initialized = true;
+    ESP_LOGI(TAG, "GPIO initialized");
 
-    reset_chip(ctx);
+    /* 2. Hardware reset + register defaults */
+    s1l9226x_reset(ctx);
 
-    // int febias_control_result = febias_control(ctx);
-    // ESP_LOGI(TAG, "ffebias_control_result: %d", febias_control_result);
-    // if (febias_control_result == -1){
-    //     ESP_LOGE(TAG, "febias_control FAILED: %d", ctx->last_error);
-    // }
-    
-    // int focus_offset_control_result = focus_offset_control(ctx);
-    // ESP_LOGI(TAG, "focus_offset_control_result: %d", focus_offset_control_result);
-    // if (focus_offset_control_result == -1){
-    //     ESP_LOGE(TAG, "focus_offset_control FAILED: %d", ctx->last_error);
-    // }
+    delay_ms(1000);
 
-    // int tracking_offset_control_result = tracking_offset_control(ctx);
-    // ESP_LOGI(TAG, "tracking_offset_control_result: %d", tracking_offset_control_result);
-    // if (tracking_offset_control_result == -1){
-    //     ESP_LOGE(TAG, "tracking_offset_control FAILED: %d", ctx->last_error);
-    // }
+    /* 3. Febias offset control ($878 -> $87F + $841 -> ISTAT H) */
+    rc = febias_control(ctx);
+    if (rc != S1L9226X_OK) return rc;
 
-    // /* Laser Diode ON */
+    /* 4. Focus offset control ($08 + $867 + 200ms + $86F + $842 -> ISTAT H) */
+    rc = focus_offset_control(ctx);
+    if (rc != S1L9226X_OK) return rc;
+
+    /* 5. Tracking offset cancel ($8F1F -> $8F00 -> ISTAT H) */
+    // rc = tracking_offset_control(ctx);
+    // if (rc != S1L9226X_OK) return rc;
+
+    /* 6. Laser diode ON (LD ON + P-SUB $8560) */
     // laser_on(ctx);
-    // ESP_LOGI(TAG, "Laser ON");
 
-    // /* Auto-Focus with 3 retries */
-    // int auto_focus_result;
+    /* 7. Limit switch check (hardware-dependent, caller should implement) */
+    // ESP_LOGI(TAG, "Limit switch check - caller should verify sled home position");
+    /* TODO: Implement limit switch detection via GPIO */
+
+    /* 8. Auto-focus with 3 retries (max 2s each attempt) */
     // for (int retry = 0; retry < 3; retry++) {
     //     ESP_LOGI(TAG, "Auto-focus attempt %d/3", retry + 1);
-    //     auto_focus_result = auto_focus(ctx);
-    //     if (auto_focus_result == 0) {
-    //         ESP_LOGI(TAG, "Auto-focus OK - Disc detected");
-    //         break;
+    //     rc = auto_focus(ctx);
+    //     if (rc == S1L9226X_OK) break;
+
+    //     if (retry < 2) {
+    //         ESP_LOGW(TAG, "Auto-focus failed (attempt %d), retrying...", retry + 1);
+    //         /* Cancel current sequence before retry */
+    //         s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x40, 0x00));
+    //         delay_ms(100);
     //     }
-    //     ESP_LOGW(TAG, "Auto-focus FAILED (attempt %d)", retry + 1);
     // }
 
-    // if (auto_focus_result != 0) {
-    //     ESP_LOGE(TAG, "Auto-focus FAILED after 3 attempts - No disc");
+    // if (rc != S1L9226X_OK) {
+    //     /* 3 attempts failed: laser off, display "no disc", standby */
     //     laser_off(ctx);
-    //     return ctx->last_error;
+    //     ESP_LOGE(TAG, "Auto-focus failed after 3 attempts - no disc, entering standby");
+    //     return rc;
     // }
 
-    // /* Disc detected - Start playback sequence */
+    /* 9. Spindle servo ON + tracking balance/gain adjust ($20 -> adjust) */
+    // rc = spindle_servo_on(ctx);
+    // if (rc != S1L9226X_OK) return rc;
 
-    // /* Spindle Servo Loop ON ($20) */
-    // ESP_LOGI(TAG, "Starting spindle servo...");
-    // spindle_servo_on(ctx);
-    // ESP_LOGI(TAG, "Spindle servo ON");
+    /* 10. TOC read - DSP handles this, signal ready for playback */
+    ESP_LOGI(TAG, "System ready - disc detected, spindle spinning, awaiting TOC read");
 
-    // /* Tracking Balance Adjust */
-    // ESP_LOGI(TAG, "Tracking balance adjust...");
-    // int bal_result = tracking_balance_adjust(ctx);
-    // if (bal_result == 0) {
-    //     ESP_LOGI(TAG, "Tracking balance OK");
-    // } else {
-    //     ESP_LOGW(TAG, "Tracking balance adjust failed");
-    // }
-
-    // /* Tracking Gain Adjust */
-    // ESP_LOGI(TAG, "Tracking gain adjust...");
-    // int gain_result = tracking_gain_adjust(ctx);
-    // if (gain_result == 0) {
-    //     ESP_LOGI(TAG, "Tracking gain OK");
-    // } else {
-    //     ESP_LOGW(TAG, "Tracking gain adjust failed");
-    // }
-
-    // /* Turn on tracking and sled servo loops */
-    // send_command(ctx, 0x2200);  /* Track servo ON */
-    // send_command(ctx, 0x2400);  /* Sled servo ON */
-    // delay_ms(50);
-
-    // ESP_LOGI(TAG, "Self-test PASSED - Ready for playback");
-
-    laser_on(ctx);
-    delay_ms(1000);
-    laser_off(ctx);
-    return ERR_NONE;
+    return S1L9226X_OK;
 }

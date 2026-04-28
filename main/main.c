@@ -19,7 +19,7 @@ void app_main(void)
 
     int result = s1l9226x_power_on_self_test(&servo_ctx);
 
-    if (result == ERR_NONE) {
+    if (result == 0) {
         ESP_LOGI(TAG, "Self-test PASSED - Disc present, ready for playback");
     } else {
         ESP_LOGE(TAG, "Self-test FAILED - Error: %d", result);
