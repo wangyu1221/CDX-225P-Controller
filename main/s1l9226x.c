@@ -308,6 +308,42 @@ static s1l9226x_err_t focus_offset_control(s1l9226x_ctx_t *ctx)
     return S1L9226X_OK;
 }
 
+static s1l9226x_err_t test_tracking_offset(s1l9226x_ctx_t *ctx)
+{
+    ESP_LOGI(TAG, "Test tracking offset: move inward 1 step, then outward 1 step, then stop");
+
+    /* $8F is a 5-bit DAC, INI = 0x10 (0mV center)
+     * Each step = ~10mV, range: $8F1F(-160mV) ~ $8F00(+160mV)
+     * Higher value = more negative = inward (toward ID)
+     * Lower value = more positive = outward (toward OD) */
+
+    /* Step 1: Move inward 1 step (0x10 -> 0x11 = -10mV) */
+    ESP_LOGI(TAG, "  -> INWARD: $8F = 0x11 (-10mV)");
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x8F, 0x11));
+    delay_ms(200);
+
+    /* Step 2: Move outward 1 step (0x11 -> 0x0F = +10mV, skip center) */
+    ESP_LOGI(TAG, "  -> OUTWARD: $8F = 0x0F (+10mV)");
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x8F, 0x0F));
+    delay_ms(200);
+
+    /* Step 3: Stop
+     * Use $20 (TM1 mode): spindle on, tracking/sled OFF.
+     * $20 is more reliable than $21 because it explicitly sets chip mode
+     * where BOTH tracking and sled servos are disabled.
+     * First restore $8F to center to remove any DC drive current. */
+    ESP_LOGI(TAG, "  -> Restoring $8F = 0x10 (center)");
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x8F, 0x10));
+    delay_ms(20);
+
+    ESP_LOGI(TAG, "  -> Sending $20 (TM1: tracking/sled OFF)");
+    s1l9226x_send_cmd(ctx, S1L9226X_CMD(0x20, 0x00));
+    delay_ms(200);
+
+    ESP_LOGI(TAG, "Test tracking offset done");
+    return S1L9226X_OK;
+}
+
 /* ================================================================
  * Step 3: Tracking Offset Cancel
  * ================================================================
@@ -610,6 +646,8 @@ s1l9226x_err_t s1l9226x_power_on_self_test(s1l9226x_ctx_t *ctx)
     if (rc != S1L9226X_OK) return rc;
 
     /* 5. Tracking offset cancel ($8F1F -> $8F00 -> ISTAT H) */
+    test_tracking_offset(ctx);
+
     // rc = tracking_offset_control(ctx);
     // if (rc != S1L9226X_OK) return rc;
 
